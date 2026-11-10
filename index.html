@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chromesthesia</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font: 14px system-ui, sans-serif; transition: background-color 2s; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  .panel { position: fixed; left: 16px; z-index: 1; background: #0009; border-radius: 8px; padding: 8px 10px; }
+  #bar { top: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; right: 16px; width: fit-content; }
+  button, label.btn { background: #222; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:focus-visible, label.btn:focus-within { outline: 2px solid #fff; }
+  #file { position: absolute; opacity: 0; width: 1px; }
+  audio { height: 32px; max-width: 100%; }
+  #readout { bottom: 16px; font: 12px ui-monospace, monospace; line-height: 1.6; min-width: 180px; }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 50%; vertical-align: -2px; margin-right: 6px; }
+  details { max-width: 440px; font-size: 12px; line-height: 1.5; }
+  details summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar" class="panel">
+  <button id="mic">Use microphone</button>
+  <label class="btn">Open audio file<input id="file" type="file" accept="audio/*"></label>
+  <audio id="player" controls hidden></audio>
+  <details>
+    <summary>How sound becomes vision</summary>
+    <ul>
+      <li><b>Lightness</b> follows pitch height: low notes dark, high notes light (Ward et al. 2006, synaesthete data).</li>
+      <li><b>Colourfulness</b> peaks around B3. Piano and strings look more vivid than pure tones (Ward 2006).</li>
+      <li><b>Hue</b> follows the note: C red, D yellow, E yellow-green, F green, G cyan-blue, A blue-violet, B violet. Saturation drops from C to B (Itoh et al. 2017).</li>
+      <li><b>Each note is a soft cloud of light</b> that blooms with the sound, fades with it, and leaves its colour lingering in the field for a few seconds, so a song builds up its own wash of colour. Higher notes sit higher and are smaller; louder notes are bigger (Chiou et al. 2013).</li>
+      <li><b>Shape</b> follows timbre. Soft sounds make wide, diffuse clouds; bright, harsh sounds (brass-like, buzzy synths, cymbals) make denser, more contrasting, splintered forms (Adeli et al. 2014, replicated 2021). Nothing has hard edges: synaesthetes describe and draw blurred light.</li>
+      <li><b>Texture</b>: rough sounds (beating, dissonance, muddy low chords) look grainy with a ragged edge and flicker; clean tones look smooth. Listeners treat "rough" and "sharp" as different shapes, and synaesthetes describe textures like "granulated", soft centres and fuzzy edges.</li>
+      <li><b>Gliding pitch</b> drags a soft trail through the field, like a sparkler (a synaesthete's description in Ward 2006).</li>
+      <li><b>Left/right</b> follows the stereo position of the sound. A mic is mono, so everything sits near the centre.</li>
+      <li><b>Chords</b> show one colour per note. Overlapping objects add up like light.</li>
+      <li><b>Overall tint</b> follows tempo and key: fast/major music turns the whole field light, warm and vivid; slow/minor music turns it dark, blue and muted (Palmer et al. 2013).</li>
+    </ul>
+  </details>
+</div>
+<div id="readout" class="panel" aria-live="polite">Pick a source to start.</div>
+
+<script src="synesthesia.js"></script>
+<script>
+'use strict';
+const S = window.Synesthesia;
+const canvas = document.getElementById('c'), g = canvas.getContext('2d');
+const readout = document.getElementById('readout'), player = document.getElementById('player');
+let ctx, analyser, anL, anR, db, dbL, dbR, prevLin, mediaSrc, micStream, running = false;
+
+const KEY_MEMORY = 8;    // seconds of notes the key detector remembers
+const TEMPO_WINDOW = 6;  // seconds of onsets the tempo detector looks at
+const RELEASE = 0.25;    // seconds for an object to fade once its sound stops
+const FIELD_MEMORY = 4;  // seconds colour lingers in the field before fading back to the mood tint
+const FIELD_RES = 1 / 6, LIVE_RES = 1 / 3; // low-res layers, smoothed when scaled up = real blur, cheap
+const chroma = new Float64Array(12);
+const flux = [], objects = [], marks = [];
+let lastT = 0, lastSlow = 0, dtAvg = 1 / 60, mood = 0, keyInfo = null, bpm = 0, bg = [0, 0, 0];
+// field: lingering wash that notes pour colour into; live: soft glow of what is sounding now
+const field = document.createElement('canvas'), fg = field.getContext('2d');
+const live = document.createElement('canvas'), lg = live.getContext('2d');
+
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  field.width = Math.ceil(innerWidth * FIELD_RES); field.height = Math.ceil(innerHeight * FIELD_RES);
+  live.width = Math.ceil(innerWidth * LIVE_RES); live.height = Math.ceil(innerHeight * LIVE_RES);
+}
+addEventListener('resize', resize); resize();
+
+function ensureCtx() {
+  if (!ctx) {
+    ctx = new AudioContext();
+    const mk = () => Object.assign(ctx.createAnalyser(), { fftSize: 8192, smoothingTimeConstant: 0 });
+    analyser = mk(); anL = mk(); anR = mk();
+    db = new Float32Array(analyser.frequencyBinCount);
+    dbL = new Float32Array(db.length); dbR = new Float32Array(db.length);
+    prevLin = new Float32Array(db.length);
+  }
+  ctx.resume();
+}
+
+// Connects one source: a mono analyser for the music, plus left/right analysers for stereo position.
+window.useSource = function (node, audible) {
+  ensureCtx();
+  analyser.disconnect();
+  if (window.currentSource && window.currentSource !== node) window.currentSource.disconnect();
+  node.connect(analyser);
+  const split = ctx.createChannelSplitter(2);
+  node.connect(split); split.connect(anL, 0); split.connect(anR, Math.min(1, node.channelCount - 1));
+  if (audible) analyser.connect(ctx.destination);
+  window.currentSource = node;
+  if (!running) { running = true; requestAnimationFrame(frame); }
+  return ctx;
+};
+
+document.getElementById('mic').onclick = async () => {
+  try {
+    ensureCtx();
+    // Raw signal: voice processing would strip and distort music.
+    micStream = micStream || await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    player.pause();
+    useSource(ctx.createMediaStreamSource(micStream), false);
+  } catch (e) { readout.textContent = 'Microphone unavailable: ' + e.message; }
+};
+
+document.getElementById('file').onchange = (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  ensureCtx();
+  if (player.src) URL.revokeObjectURL(player.src);
+  player.src = URL.createObjectURL(f);
+  player.hidden = false;
+  mediaSrc = mediaSrc || ctx.createMediaElementSource(player); // allowed once per element
+  useSource(mediaSrc, true);
+  player.play();
+};
+
+const yFor = (hz) => { // log pitch, A0 at bottom, C8 at top
+  const t = Math.log2(hz / 27.5) / Math.log2(4186 / 27.5);
+  return innerHeight * (0.95 - 0.9 * Math.min(1, Math.max(0, t)));
+};
+
+// One cloud of light, blurred in proportion to its size. Soft sounds: wide blur, diffuse. Harsh sounds:
+// less blur, so the splintered outline and contrast show. The drawings and reports never show hard
+// edges, so even the harshest form stays soft. Blurred once into a cached sprite (canvas shadow blur
+// works in every browser), then just scaled each frame; re-rendered only when the timbre changes.
+const OFF = 100000, REF = 24; // draw off-canvas, keep only the blurred shadow; sprite radius in px
+function sprite(o) {
+  if (o.sprite && Math.abs(o.j - o.outJ) <= 0.12 && Math.abs(o.grain - o.outG) <= 0.2) return o.sprite;
+  o.out = S.outline(o.j, o.seed, o.grain, 48); o.outJ = o.j; o.outG = o.grain;
+  const blur = REF * (0.55 - 0.35 * o.j), max = Math.max(...o.out) * REF;
+  const c = document.createElement('canvas'), x = c.getContext('2d'), size = Math.ceil(2 * (max + 2 * blur)), mid = size / 2;
+  c.width = c.height = size;
+  const shape = (scale) => {
+    x.beginPath();
+    o.out.forEach((v, i) => {
+      const th = (i / o.out.length) * 2 * Math.PI + o.spin;
+      x.lineTo(mid - OFF + v * REF * scale * Math.cos(th), mid + v * REF * scale * Math.sin(th));
+    });
+    x.fill();
+  };
+  x.fillStyle = '#000'; x.shadowOffsetX = OFF;
+  x.shadowColor = `rgb(${o.rgb.join(',')})`; x.shadowBlur = blur;
+  shape(1);
+  x.shadowColor = `rgba(${o.rgb.map((v) => Math.round(v + (255 - v) * 0.4)).join(',')},0.8)`; // luminous core
+  x.shadowBlur = REF * 0.35;
+  shape(0.45);
+  return (o.sprite = c);
+}
+function blob(c, x, y, r, o, alpha) {
+  if (alpha < 0.004 || r < 0.5) return;
+  const s = sprite(o), w = (s.width * r) / REF;
+  c.globalAlpha = Math.min(1, alpha);
+  c.drawImage(s, x - w / 2, y - w / 2, w, w);
+  c.globalAlpha = 1;
+}
+
+function spawn(t, props) {
+  const o = { ...props, t0: t, last: t, min: props.loud, level: props.loud, seed: (Math.random() * 2 ** 32) >>> 0,
+    spin: Math.random() * 2 * Math.PI, lo: props.m, hi: props.m };
+  objects.push(o);
+  return o;
+}
+
+function frame(t) {
+  requestAnimationFrame(frame);
+  const dt = lastT ? Math.min(0.1, (t - lastT) / 1000) : 1 / 60;
+  lastT = t; dtAvg += (dt - dtAvg) * 0.05;
+  const W = innerWidth, H = innerHeight;
+
+  analyser.getFloatFrequencyData(db); anL.getFloatFrequencyData(dbL); anR.getFloatFrequencyData(dbR);
+  const notes = S.detectNotes(db, ctx.sampleRate, analyser.fftSize);
+  const binHz = ctx.sampleRate / analyser.fftSize;
+  const panAt = (hz) => { // -1 left … +1 right, from the note's level in each channel
+    const k = Math.round(hz / binHz), l = 10 ** (dbL[k] / 20), r = 10 ** (dbR[k] / 20);
+    return l + r > 0 ? (r - l) / (r + l) : 0;
+  };
+
+  // onset strength = positive log-compressed spectral flux (so loud notes don't drown soft ones)
+  let fl = 0;
+  for (let i = 0; i < db.length; i++) {
+    const m = Math.log1p(1000 * 10 ** (db[i] / 20));
+    if (m > prevLin[i]) fl += m - prevLin[i];
+    prevLin[i] = m;
+  }
+  flux.push([t, fl]);
+  while (flux.length && t - flux[0][0] > TEMPO_WINDOW * 1000) flux.shift();
+
+  const decay = Math.exp(-dt / KEY_MEMORY);
+  for (let i = 0; i < 12; i++) chroma[i] *= decay;
+  for (const n of notes) chroma[((n.midi % 12) + 12) % 12] += n.salience;
+
+  if (t - lastSlow > 1000) {
+    lastSlow = t;
+    keyInfo = chroma.some((v) => v > 0) ? S.detectKey(Array.from(chroma)) : null;
+    // frames arrive unevenly, so put onsets on a fixed 20 ms grid (max per bin) before autocorrelation
+    const GRID = 0.02, bins = new Array(Math.round(TEMPO_WINDOW / GRID)).fill(NaN);
+    for (const [ft, v] of flux) { const k = Math.floor((ft - (t - TEMPO_WINDOW * 1000)) / 1000 / GRID); if (k >= 0 && k < bins.length) bins[k] = Math.max(bins[k] || 0, v); }
+    for (let k = 0; k < bins.length; k++) if (isNaN(bins[k])) bins[k] = k ? bins[k - 1] : 0; // no frame in this slot: hold
+    bpm = flux.length && t - flux[0][0] > 2000 ? S.detectBpm(bins, GRID) : 0;
+    // ponytail: equal weight on mode and tempo; Palmer 2013 found both push the same way.
+    const tempoScore = bpm ? Math.max(-1, Math.min(1, (bpm - 100) / 40)) : 0;
+    // a song's mood changes slowly: smooth over ~4 s so key-detection wobble (C major vs A minor share
+    // every note) doesn't make the whole field flicker
+    mood += (((keyInfo ? keyInfo.majorness : 0) + tempoScore) / 2 - mood) * (1 - Math.exp(-1 / 4));
+    bg = S.moodColor(mood);
+    document.body.style.backgroundColor = `rgb(${bg.join(',')})`;
+  }
+
+  // ---- match sounds to objects ----
+  const loudness = (dB) => Math.min(1, Math.max(0, (dB + 80) / 60));
+  const update = (o, loud, j) => {
+    o.last = t; o.level = loud;
+    o.loud = Math.max(o.loud, loud);
+    o.min = loud < o.loud ? Math.min(o.min, loud) : loud;
+    o.j += (j - o.j) * 0.2;
+  };
+  const restruck = (o, loud) => o.min < o.loud - 0.2 && loud > o.min + 0.2;
+  const used = new Set(), allF0s = notes.map((n) => n.hz);
+  for (const n of notes) {
+    const rough = S.roughness(db, ctx.sampleRate, analyser.fftSize, n.hz, allF0s), grain = S.grain(rough);
+    const m = S.hzToMidi(n.hz), loud = loudness(n.db), j = S.jaggedness(n.brightness, n.hz);
+    n.rgb = S.noteColor(n.hz, Math.min(1, n.richness / 0.4)).rgb; // ponytail: 0.4 ≈ sawtooth richness = "fully rich"; tune per mic
+    // continue the nearest sounding object within ~2/3 semitone, so a glide stays one object
+    let o = null;
+    for (const c of objects)
+      if (!c.noise && !used.has(c) && t - c.last < 150 && Math.abs(c.m - m) < 0.7 && (!o || Math.abs(c.m - m) < Math.abs(o.m - m))) o = c;
+    if (o && !restruck(o, loud)) {
+      update(o, loud, j);
+      o.m += (m - o.m) * 0.5; o.hz = n.hz; o.rgbNow = n.rgb;
+      o.lo = Math.min(o.lo, o.m); o.hi = Math.max(o.hi, o.m);
+      o.grain += (grain - o.grain) * 0.2;
+    } else {
+      o = spawn(t, { m, hz: n.hz, rgb: n.rgb, rgbNow: n.rgb, j, grain, loud, pan: panAt(n.hz) });
+    }
+    used.add(o);
+  }
+  // unpitched noise (cymbal, hi-hat, snare) → one splintered, grainy object at its spectral centroid
+  const nz = S.noise(db, ctx.sampleRate, analyser.fftSize);
+  if (nz.flatness > 0.3 && nz.db > -95) {
+    let peak = -Infinity;
+    for (let i = 0; i < db.length; i++) if (db[i] > peak) peak = db[i];
+    const loud = loudness(peak);
+    let o = objects.find((c) => c.noise && t - c.last < 150);
+    if (o && !restruck(o, loud)) update(o, loud, 1);
+    else spawn(t, { noise: true, m: S.hzToMidi(nz.centroid), hz: nz.centroid, rgb: S.noiseColor(nz.centroid), j: 1, grain: 1, loud, pan: 0 });
+  }
+
+  // ---- draw ----
+  // Field: every object leaves a stain that fills while the note sounds and fades over FIELD_MEMORY
+  // seconds after, so a song builds a lingering wash of its colours. Redrawn exactly each frame.
+  fg.fillStyle = `rgb(${bg.join(',')})`;
+  fg.fillRect(0, 0, field.width, field.height);
+  lg.clearRect(0, 0, live.width, live.height);
+  // a slow wander across the field (stereo position shifts it), so a song spreads its colours out
+  const wanderX = W / 2 + Math.sin(t / 7000) * W * 0.25, wanderY = Math.sin(t / 11000) * H * 0.04;
+  for (let i = marks.length - 1; i >= 0; i--) { // glide trail: the sparkler line
+    const mk = marks[i], a = mk.amount * Math.exp(-(t - mk.t) / 1000 / FIELD_MEMORY);
+    if (a < 0.01) { marks.splice(i, 1); continue; }
+    blob(fg, mk.x * FIELD_RES, mk.y * FIELD_RES, mk.r * FIELD_RES, mk, a);
+  }
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const o = objects[i];
+    if (t - o.last > 50) o.level *= Math.exp(-dt / RELEASE); // sound gone: fade with it
+    const stain = (o.amount || 0) * Math.exp(-Math.max(0, t - o.last) / 1000 / FIELD_MEMORY);
+    if (o.level < 0.02 && stain < 0.01 && t - o.last > 150) { objects.splice(i, 1); continue; }
+    const age = (t - o.t0) / 1000;
+    if (o.x === undefined) o.x = wanderX + o.pan * W * 0.3 + (Math.random() - 0.5) * W * 0.12;
+    const x = o.x, y = yFor(o.hz) + wanderY;
+    const R = (14 + 60 * o.loud) * (1.3 - (0.6 * (H - y)) / H) * (0.75 + 0.25 * (1 - Math.exp(-age / 0.06))); // louder bigger, higher smaller, quick bloom
+    const lvl = o.level < 0.02 ? 0 : Math.min(1, (o.level / Math.max(o.loud, 0.05)) * 1.1);
+    if (lvl) o.amount = Math.min(0.85, (o.amount || 0) + lvl * dt * 2.5); // pour colour in while it sounds
+    blob(fg, x * FIELD_RES, y * FIELD_RES, R * 1.8 * FIELD_RES, o, stain);
+    if (o.hi - o.lo > 0.5 && lvl && (!o.markT || t - o.markT > 60)) {
+      marks.push({ x, y, r: R * 0.5, t, amount: 0.5 * lvl, sprite: sprite(o), j: o.j, grain: o.grain, outJ: o.j, outG: o.grain });
+      o.markT = t;
+    }
+    if (!lvl) continue;
+    blob(lg, x * LIVE_RES, y * LIVE_RES, R * LIVE_RES, o, lvl * (1 - 0.35 * o.grain * Math.random())); // rough sounds scintillate
+    if (o.grain > 0.05) { // grain: mottled specks, softened by the low-res layer
+      lg.fillStyle = `rgba(${o.rgb.map((v) => Math.round(v + (255 - v) * 0.5)).join(',')},${0.5 * lvl})`;
+      for (let k = 0; k < 30 * o.grain; k++) {
+        const a = Math.random() * 2 * Math.PI, d = R * Math.sqrt(Math.random());
+        lg.fillRect((x + d * Math.cos(a)) * LIVE_RES, (y + d * Math.sin(a)) * LIVE_RES, 1, 1);
+      }
+    }
+  }
+  g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+  g.globalCompositeOperation = 'source-over';
+  g.drawImage(field, 0, 0, W, H);
+  g.globalCompositeOperation = 'screen'; // light on light, without clipping to white
+  g.drawImage(live, 0, 0, W, H);
+  g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+
+  readout.innerHTML =
+    (notes.length ? notes.map((n) => `<span class="sw" style="background:rgb(${n.rgb.join(',')})"></span>${n.name.padEnd(4)} ${n.hz.toFixed(1)} Hz`).join('<br>') : '…') +
+    `<br><br>key ${keyInfo ? keyInfo.tonic + ' ' + keyInfo.mode : '–'} · tempo ${bpm ? Math.round(bpm) + ' BPM' : '–'}`;
+}
+</script>
+</body>
+</html>
